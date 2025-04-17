@@ -1,78 +1,85 @@
-import fetch from 'node-fetch';
-import { Polly } from '@aws-sdk/client-polly';
-import { PassThrough } from 'stream';
 import ffmpeg from 'fluent-ffmpeg';
-import fs from 'fs';
 import path from 'path';
+import fs from 'fs';
+import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
+import { S3 } from '@aws-sdk/client-s3';
+import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { Readable } from 'stream';
 
-const polly = new Polly({ region: 'ap-south-1' });
+// ffmpeg.setFfmpegPath('/opt/homebrew/bin/ffmpeg'); 
+// Safe path wrapper
+function safePath(p: string): string {
+  return `"${p.replace(/"/g, '')}"`;
+}
 
 const STABLE_HORDE_API_KEY = process.env.STABLE_HORDE_API_KEY!;
 const STABLE_HORDE_URL = 'https://stablehorde.net/api/v2/generate/async';
 
+// Initialize AWS S3 client
+const s3 = new S3({
+  region: process.env.AWS_REGION || 'ap-south-1',
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || '',
+  }
+});
+
+// Temporary directory setup
+const tempDir = path.join(process.cwd(), 'tmp');
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
+}
+
 export async function generateVideo(
   celebrity: string,
   script: string,
+  audioUrl: string
 ): Promise<Buffer> {
+  const imagePath = path.join(tempDir, `${uuidv4()}.png`);
+  const audioPath = path.join(tempDir, `${uuidv4()}.mp3`);
+  const videoPath = path.join(tempDir, `${uuidv4()}.mp4`);
+
   try {
-    console.log('Starting video generation for:', celebrity);
+    console.log("Generating video for:", celebrity);
+    console.log("Using audio from:", audioUrl);
 
     // Step 1: Generate Image using Stable Horde
-    // const prompt = `Epic sports moment of ${celebrity}, cinematic lighting, action shot`;
-    // const imageUrl = await generateImageFromStableHorde(prompt);
-    // console.log('Image generated:', imageUrl);
+    // const imageUrl = await generateImageFromStableHorde(celebrity);
+    const imageUrl = "https://placehold.co/1920x1080.png";
+    console.log("Image generated successfully:", imageUrl);
 
-    const imageUrl= "https://a223539ccf6caa2d76459c9727d276e6.r2.cloudflarestorage.com/stable-horde/99ce1b17-39e8-487c-9d6b-704a1188d045.webp?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=246782cc9101762ba914350d8058cd83%2F20250417%2Fauto%2Fs3%2Faws4_request&X-Amz-Date=20250417T103808Z&X-Amz-Expires=1800&X-Amz-SignedHeaders=host&X-Amz-Signature=110519533e7886384f5f20d85ecbb5fafb6e6d9cad59ca0830d8546ae2424ada"
+    // Step 2: Download image
+    await downloadFile(imageUrl, imagePath);
+    console.log("Image downloaded to:", imagePath);
 
-    // Step 2: Generate Audio using AWS Polly
-    const audioResponse = await polly.synthesizeSpeech({
-      Text: script,
-      OutputFormat: 'mp3',
-      VoiceId: 'Joanna',
-    });
+    // Step 3: Download audio
+    await downloadAudioFromS3(audioUrl, audioPath);
+    console.log("Audio downloaded to:", audioPath);
 
-    const audioStream = audioResponse.AudioStream!;
-    const imagePath = await downloadImage(imageUrl);
+    // Step 4: Generate video
+    const videoBuffer = await createVideoFromImageAndAudio(imagePath, audioPath, videoPath);
+    console.log("Video generated successfully");
 
-    // Step 3: Combine image and audio using FFmpeg
-    const outputBuffer = await new Promise<Buffer>((resolve, reject) => {
-      const buffers: any[] = [];
-      const bufferStream = new PassThrough();
-
-      bufferStream.on('data', (chunk) => buffers.push(chunk));
-      bufferStream.on('end', () => resolve(Buffer.concat(buffers)));
-      bufferStream.on('error', reject);
-
-      ffmpeg()
-        .input(imagePath)
-        .loop(10)
-        .input(audioStream)
-        .outputOptions([
-          '-c:v libx264',
-          '-preset fast',
-          '-crf 22',
-          '-c:a aac',
-          '-b:a 128k',
-          '-shortest',
-        ])
-        .format('mp4')
-        .on('error', reject)
-        .pipe(bufferStream, { end: true });
-    });
-
-    // Cleanup
-    fs.unlinkSync(imagePath);
-
-    return outputBuffer;
+    return videoBuffer;
   } catch (error) {
     console.error('Video generation error:', error);
     throw error;
+  } finally {
+    // Cleanup temp files
+    [imagePath, audioPath, videoPath].forEach(file => {
+      if (fs.existsSync(file)) {
+        try {
+          fs.unlinkSync(file);
+        } catch (e) {
+          console.error(`Failed to delete temporary file ${file}:`, e);
+        }
+      }
+    });
   }
 }
 
 async function generateImageFromStableHorde(prompt: string): Promise<string> {
-  // Step 1: Request image generation
   const response = await fetch(STABLE_HORDE_URL, {
     method: 'POST',
     headers: {
@@ -93,9 +100,8 @@ async function generateImageFromStableHorde(prompt: string): Promise<string> {
   });
 
   const { id } = await response.json();
-
-  // Step 2: Poll for result
   const pollUrl = `https://stablehorde.net/api/v2/generate/status/${id}`;
+
   while (true) {
     const status = await fetch(pollUrl, {
       headers: { apikey: STABLE_HORDE_API_KEY },
@@ -110,10 +116,99 @@ async function generateImageFromStableHorde(prompt: string): Promise<string> {
   }
 }
 
-async function downloadImage(url: string): Promise<string> {
-  const res = await fetch(url);
-  const buffer = await res.buffer();
-  const filename = path.join('/tmp', `${uuidv4()}.png`);
-  fs.writeFileSync(filename, buffer);
-  return filename;
+async function downloadFile(url: string, outputPath: string): Promise<void> {
+  const response = await axios({
+    url,
+    method: 'GET',
+    responseType: 'arraybuffer'
+  });
+
+  fs.writeFileSync(outputPath, Buffer.from(response.data));
+}
+
+async function downloadAudioFromS3(audioUrl: string, outputPath: string): Promise<void> {
+  try {
+    let bucket, key;
+
+    if (audioUrl.startsWith('s3://')) {
+      const parts = audioUrl.replace('s3://', '').split('/');
+      bucket = parts[0];
+      key = parts.slice(1).join('/');
+    } else if (audioUrl.includes('s3.') && audioUrl.includes('amazonaws.com')) {
+      const url = new URL(audioUrl);
+      bucket = url.hostname.split('.')[0];
+      key = url.pathname.substring(1);
+    } else {
+      bucket = process.env.AWS_S3_BUCKET || '';
+      key = audioUrl;
+    }
+
+    if (!bucket) throw new Error('Could not determine S3 bucket from URL: ' + audioUrl);
+
+    console.log(`Downloading from S3: bucket=${bucket}, key=${key}`);
+
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const response = await s3.send(command);
+
+    if (!response.Body) throw new Error('S3 returned empty body');
+
+    const chunks = [];
+    for await (const chunk of response.Body as Readable) {
+      chunks.push(chunk);
+    }
+
+    fs.writeFileSync(outputPath, Buffer.concat(chunks));
+  } catch (error) {
+    console.error('Error downloading audio from S3:', error);
+    throw error;
+  }
+}
+
+async function createVideoFromImageAndAudio(
+  imagePath: string, 
+  audioPath: string, 
+  outputPath: string
+): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    ffmpeg()
+      .input(safePath(imagePath))
+      .inputOptions([
+        '-loop 1',
+        '-framerate 30'
+      ])
+      .input(safePath(audioPath))
+      .outputOptions([
+        '-c:v libx264',
+        '-tune stillimage',
+        '-preset medium',
+        '-crf 22',
+        '-c:a aac',
+        '-b:a 192k',
+        '-pix_fmt yuv420p',
+        '-shortest',
+        '-vf',
+        'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2',
+        '-movflags +faststart'
+      ])
+      .output(safePath(outputPath))
+      .on('start', (commandLine) => {
+        console.log('FFmpeg command:', commandLine);
+      })
+      .on('progress', (progress) => {
+        console.log(`Processing: ${progress.percent?.toFixed(1)}% done`);
+      })
+      .on('end', () => {
+        try {
+          const videoBuffer = fs.readFileSync(outputPath);
+          resolve(videoBuffer);
+        } catch (err) {
+          reject(err);
+        }
+      })
+      .on('error', (err) => {
+        console.error('Error during FFmpeg processing:', err);
+        reject(err);
+      })
+      .run();
+  });
 }

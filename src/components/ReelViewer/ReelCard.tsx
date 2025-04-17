@@ -18,6 +18,7 @@ export default function ReelCard({ reel, isActive }: ReelCardProps) {
   const [isMuted, setIsMuted] = useState(true);
 
   useEffect(() => {
+    console.log('Video URL:', reel.url);
     if (!videoRef.current) return;
 
     if (isActive) {
@@ -43,8 +44,9 @@ export default function ReelCard({ reel, isActive }: ReelCardProps) {
   return (
     <div className={styles.reelCard}>
       <video
+      crossOrigin="anonymous"
         ref={videoRef}
-        src="https://www.w3schools.com/html/mov_bbb.mp4"
+        src={reel.url}
         controls={false}
         playsInline
         loop
