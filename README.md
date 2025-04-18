@@ -5,7 +5,7 @@
 
 ## 📌 Project Status
 🚧 **Work in Progress** - Core functionality implemented but not yet production-ready  
-✅ Currently working: AI script generation, and Audito Genertaion  
+✅ Currently working: AI script generation, and Audito Generation  
 🔧 In development: Video composition,Improved UI, deployment pipeline  
 
 ## ✨ Features
